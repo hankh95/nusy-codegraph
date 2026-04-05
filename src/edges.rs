@@ -6,7 +6,9 @@
 
 use crate::parser::{ImportInfo, ParseResult};
 use crate::schema::{CodeEdge, CodeEdgePredicate, CodeNode, CodeNodeKind};
+use crate::scip_calls;
 use std::collections::HashMap;
+use std::path::Path;
 
 /// Name resolution table: maps fully-qualified names to CodeNode IDs.
 #[derive(Debug, Default)]
@@ -118,19 +120,52 @@ pub fn extract_edges(parse_results: &[ParseResult], resolver: &NameResolver) -> 
     edges
 }
 
-/// Extract call edges using simple text-based scanning.
+/// Extract call edges, preferring SCIP data when available.
 ///
-/// This is a best-effort approach: scans function/method bodies for
-/// identifiers that match known function/method names. Does not do
-/// full flow analysis.
+/// When `crate_dir` is `Some`, this first attempts `extract_scip_call_edges`
+/// (which uses rust-analyzer for compiler-quality call detection). If rust-analyzer
+/// is unavailable or fails, falls back to text-scanning via `text_scan_call_edges`.
+///
+/// Pass `crate_dir: None` to always use text scanning (e.g. for Python).
 pub fn extract_call_edges(
     parse_results: &[ParseResult],
     _resolver: &NameResolver,
     source_texts: &HashMap<String, String>,
+    crate_dir: Option<&Path>,
+) -> Vec<CodeEdge> {
+    // Collect all nodes for both SCIP and text-scan paths.
+    let all_nodes: Vec<CodeNode> = parse_results.iter().flat_map(|r| r.nodes.clone()).collect();
+
+    // Try SCIP first (Rust only — requires rust-analyzer).
+    if let Some(dir) = crate_dir {
+        let result = scip_calls::extract_scip_call_edges(dir, &all_nodes);
+        if !result.edges.is_empty() {
+            tracing::info!(
+                "SCIP call edges: {} resolved, {} unresolved ({} docs)",
+                result.symbols_resolved,
+                result.unresolved_references,
+                result.documents_processed
+            );
+            return result.edges;
+        } else if !result.warnings.is_empty() {
+            tracing::debug!("SCIP unavailable or failed, falling back to text scan: {}", result.warnings.join("; "));
+        }
+    }
+
+    // Fall back to text scanning.
+    text_scan_call_edges(&all_nodes, source_texts)
+}
+
+/// Text-based call edge extraction (best-effort).
+///
+/// Scans function/method bodies for identifiers that match known callable names.
+/// Not precise — misses indirect calls, dynamic dispatch, and variable-mediated calls.
+/// Use `extract_scip_call_edges` instead when rust-analyzer is available.
+fn text_scan_call_edges(
+    all_nodes: &[CodeNode],
+    source_texts: &HashMap<String, String>,
 ) -> Vec<CodeEdge> {
     let mut edges = Vec::new();
-
-    let all_nodes: Vec<&CodeNode> = parse_results.iter().flat_map(|r| &r.nodes).collect();
 
     // Build set of callable names
     let callable_names: HashMap<&str, &str> = all_nodes
@@ -145,7 +180,7 @@ pub fn extract_call_edges(
         .collect();
 
     // Scan each function/method body for calls
-    for node in &all_nodes {
+    for node in all_nodes {
         if !matches!(
             node.kind,
             CodeNodeKind::Function | CodeNodeKind::Method | CodeNodeKind::Test

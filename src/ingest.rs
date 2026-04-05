@@ -202,8 +202,9 @@ pub fn ingest_files(root: &Path, files: &[PathBuf]) -> Result<IngestResult> {
     let resolver = NameResolver::from_nodes(&all_nodes);
     let mut edges = extract_edges(&all_parse_results, &resolver);
 
-    // Extract call edges (best-effort text scanning)
-    let call_edges = crate::edges::extract_call_edges(&all_parse_results, &resolver, &source_texts);
+    // Extract call edges — prefer SCIP when rust-analyzer is available (Rust),
+    // fall back to text scanning for Python or when SCIP is unavailable.
+    let call_edges = crate::edges::extract_call_edges(&all_parse_results, &resolver, &source_texts, Some(root));
     edges.extend(call_edges);
 
     // Extract cross-file edges for Rust crates using module resolution
@@ -293,7 +294,8 @@ pub fn ingest_python_files(root: &Path, files: &[PathBuf]) -> Result<IngestResul
 
     let resolver = NameResolver::from_nodes(&all_nodes);
     let mut edges = extract_edges(&all_parse_results, &resolver);
-    let call_edges = crate::edges::extract_call_edges(&all_parse_results, &resolver, &source_texts);
+    // Python: text scanning only (SCIP is Rust-only).
+    let call_edges = crate::edges::extract_call_edges(&all_parse_results, &resolver, &source_texts, None);
     edges.extend(call_edges);
 
     Ok(IngestResult {
