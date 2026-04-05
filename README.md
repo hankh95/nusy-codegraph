@@ -1,141 +1,195 @@
 # nusy-codegraph
 
-**Code as a live Arrow object graph** -- parse source code into navigable, queryable Arrow RecordBatches using tree-sitter parsers.
+**Code as a live Arrow object graph** — parse source code into structured Arrow
+RecordBatches for zero-copy querying, versioning via git-native graph operations,
+semantic search, and impact analysis.
 
-## What It Does
+> **Note:** This crate depends on internal NuSy workspace crates (`nusy-arrow-core`,
+> `nusy-arrow-git`, `nusy-graph-query`, `noesis-ship`) and cannot compile standalone
+> from crates.io. It is designed for use within the NuSy monorepo or as a
+> framework reference for building your own code graph system.
 
-`nusy-codegraph` parses Python and Rust source files into two Arrow tables:
+## For AI Developers
 
-- **CodeNodes**: functions, classes, modules, files -- every object in the code graph
-- **CodeEdges**: calls, imports, inheritance, containment -- relationships between objects
+This crate demonstrates a complete code-as-graph pipeline:
 
-All data is stored as Apache Arrow RecordBatches for zero-copy querying and versioned with `nusy-arrow-git` (graph-native git on Arrow).
-
-## Quick Start
-
-```rust
-use nusy_codegraph::{parse_python_file, schema::{CodeNode, CodeEdge}, ingest_pipeline::verify_graph};
-
-// Parse a Python file into CodeNodes + CodeEdges
-let source = std::fs::read_to_string("my_module.py")?;
-let result = parse_python_file(std::path::Path::new("my_module.py"), &source)?;
-
-println!("{} nodes extracted", result.nodes.len());
-for node in &result.nodes {
-    println!("  {:?}: {}", node.kind, node.name);
-}
-
-// Parse Rust the same way
-use nusy_codegraph::rust_parser::parse_rust_file;
-
-let rust_source = std::fs::read_to_string("src/lib.rs")?;
-let rust_result = parse_rust_file(std::path::Path::new("src/lib.rs"), &rust_source)?;
+```
+Source code → tree-sitter CST → CodeNodes + CodeEdges → Arrow RecordBatches
+                                  ↓
+                          Semantic search + impact analysis
 ```
 
-## Binaries
+If you want to build a similar system for your own language or toolchain, the key
+ideas are:
 
-### `nusy-codegraph-ingest`
+1. **Use tree-sitter** for language-accurate CST parsing (not regex)
+2. **Arrow RecordBatches** for zero-copy columnar storage and Parquet persistence
+3. **CodeEdges** (calls, imports, inheritance) as first-class graph citizens
+4. **Semantic search** via embeddings over code nodes (fastembed or ollama)
+5. **Git-native versioning** via `nusy-arrow-git` WAL + atomic rename
 
-Ingest a Cargo workspace or single crate into Parquet files.
+---
 
-```bash
-# Ingest all crates in a Cargo workspace
-nusy-codegraph-ingest ingest --workspace /path/to/nusy-product-team \
-                              --output ./self-graph/
+## Features
 
-# Verify graph coherence
-nusy-codegraph-ingest verify --graph ./self-graph/
-```
+**Code Parsing**
+- **Rust** — full support: functions, structs, enums, impl blocks, macros, const, static
+- **Python** — partial support: functions, classes, async def
 
-Outputs two Parquet files:
-- `nodes.parquet` -- all CodeNodes (functions, structs, modules, etc.)
-- `edges.parquet` -- all CodeEdges (calls, imports, containment)
+**Code Graph**
+- `CodeNode` — every function, class, module as a typed node with location and signature
+- `CodeEdge` — calls, imports, inheritance, containment as typed directed edges
+- Cross-file edge resolution via `NameResolver`
+- Arrow schema for zero-copy columnar storage
 
-### `nusy-codegraph-query`
+**Semantic Search**
+- Embed code nodes via fastembed or ollama
+- Cosine similarity search over the embedded graph
+- Natural-language queries via `codegraph_query_objects`
 
-Run demonstration queries against a self-graph Parquet snapshot. Answers questions like "what does nusy-being call?" and "what crates have edges into nusy-arrow-core?"
+**Git-Native Graph Operations**
+- `codegraph_diff` — what changed in the graph between commits?
+- `codegraph_merge` — three-way graph merge with conflict detection
+- `smart_merge` — semantic merge using AST-aware conflict resolution
+- Impact analysis: which nodes are affected by a change?
 
-```bash
-nusy-codegraph-query research/shared/self-graph/
-```
+**MCP Tools**
+- `nusy-mcp-bridge` exposes 4 tools as an MCP server:
+  - `codegraph_query_objects` — search the graph
+  - `codegraph_add_edge` / `codegraph_remove_edge` — modify edges
+  - `codegraph_update_object` — update node metadata
 
-### `nusy-codegraph-service`
+**Binaries**
 
-Starts a NATS service on `codegraph.cmd.*` exposing 8 code graph tools. Loads the graph from Parquet on startup and persists mutations back.
+| Binary | Purpose |
+|--------|---------|
+| `nusy-codegraph-ingest` | Ingest a directory into the graph |
+| `nusy-codegraph-query` | Query the self-graph |
+| `nusy-codegraph-service` | Long-running NATS service mode |
+| `nusy-mcp-bridge` | MCP protocol bridge |
 
-```bash
-nusy-codegraph-service --graph-dir .codegraph \
-                       --workspace . \
-                       --nats-url nats://192.168.8.110:4222
-```
-
-### `nusy-mcp-bridge`
-
-Exposes `nusy-codegraph-service` as a [Model Context Protocol](https://modelcontextprotocol.io/) (MCP) server so Claude Code and other MCP clients can query the code graph via JSON-RPC over stdio.
-
-```bash
-nusy-mcp-bridge --nats nats://192.168.8.110:4222 --services codegraph
-```
-
-In Claude Code `settings.json`:
-
-```json
-{
-  "mcpServers": {
-    "nusy-code": {
-      "command": "nusy-mcp-bridge",
-      "args": ["--nats", "nats://192.168.8.110:4222", "--services", "codegraph"]
-    }
-  }
-}
-```
+---
 
 ## Architecture
 
+### Data Model
+
 ```
-Python/Rust source
-       │
-       ▼
-tree-sitter CST  (Concrete Syntax Tree)
-       │
-       ▼
-CodeNodes + CodeEdges  (Arrow RecordBatches)
-       │
-       ▼
-nusy-arrow-git  ──► versioned Parquet snapshots
-       │
-       ▼
-nusy-graph-query  ──► hybrid semantic + graph search
+CodeNode
+  id:            String      # "module::function" path
+  kind:          String      # function | class | module | method | ...
+  language:      String      # rust | python
+  file_path:     String
+  start_line:    u32
+  end_line:      u32
+  name:          String
+  signature:     String      # full type signature
+  doc:           String     # docstring
+
+CodeEdge
+  source_id:     String
+  predicate:     String      # calls | imports | inherits | contains | ...
+  target_id:     String
+  file_path:     String      # where the edge was observed
 ```
 
-### Node Kinds
+### Schema (Arrow)
 
-| Kind | Language | Description |
-|------|----------|-------------|
-| `File`, `Module`, `Class`, `Function` | Both | Generic code objects |
-| `RustFn`, `RustStruct`, `RustTrait`, `RustImpl`, `RustMod` | Rust | Rust-specific constructs |
-| `RustUse`, `RustMacro`, `RustConst` | Rust | Imports and declarations |
-| `PythonFunction`, `PythonClass`, `PythonDecorator` | Python | Python-specific constructs |
+```rust
+code_nodes_schema()  // subject, predicate, object, graph, version columns
+code_edges_schema()  // source_id, predicate, target_id, file_path columns
+```
 
-### Edge Predicates
+### Ingestion Pipeline
 
-| Predicate | Meaning |
-|-----------|---------|
-| `calls` | Function/method invocation |
-| `imports` | Module/crate import |
-| `contains` | Parent-child containment |
-| `inherits` | Class inheritance |
-| `param` | Function parameter |
-| `raises` | Exception raised |
-| `decorates` | Python decorator applied |
+```rust
+// 1. Discover files by language
+// 2. Parse with tree-sitter (rust_parser or python_parser)
+// 3. Extract nodes + edges from CST
+// 4. Run NameResolver for cross-file edges
+// 5. Write to Arrow RecordBatch + Parquet
+// 6. Optionally embed nodes for semantic search
+```
 
-## Dependencies
+---
 
-- `nusy-arrow-core` -- Arrow-native graph store
-- `nusy-arrow-git` -- Graph-native git primitives
-- `nusy-graph-query` -- Hybrid semantic + graph search
-- `noesis-ship` -- NATS communication
-- `tree-sitter` + `tree-sitter-python` + `tree-sitter-rust` -- Parsing
+## Quick Start
+
+```bash
+# Ingest a Rust project into the graph
+nusy-codegraph-ingest ./path/to/project --language rust
+
+# Query the self-graph (project ingests itself)
+nusy-codegraph-query "query_objects: semantic_search_term"
+
+# Start service mode (NATS)
+nusy-codegraph-service --nats nats://192.168.8.110:4222
+
+# MCP bridge for AI agent integration
+nusy-mcp-bridge --nats nats://192.168.8.110:4222
+```
+
+### As a Library
+
+```rust
+use nusy_codegraph::{
+    ingest::ingest_directory,
+    schema::{CodeNode, CodeEdge},
+    search::semantic_search,
+    edges::extract_edges,
+};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Ingest a directory
+    let result = ingest_directory("./src", Language::Rust)?;
+
+    // Search semantically
+    let results = semantic_search("error handling in REST API", top = 5)?;
+
+    // Find all callers of a function
+    let callers = nusy_codegraph::search::callers("my_crate::handle_request")?;
+
+    Ok(())
+}
+```
+
+### Semantic Diff
+
+```rust
+use nusy_codegraph::semantic_diff;
+
+let diff = semantic_diff("HEAD~1", "HEAD")?;
+println!("{}", diff.format_impact_report());
+```
+
+---
+
+## Ecosystem
+
+`nusy-codegraph` is part of the NuSy Arrow workspace:
+
+| Crate | Role |
+|-------|------|
+| [nusy-arrow-core](https://crates.io/crates/arrow-graph-core) | Arrow schemas, graph store |
+| [nusy-arrow-git](https://crates.io/crates/arrow-graph-git) | Graph-native git primitives |
+| [nusy-graph-query](https://crates.io/crates/nusy-graph-query) | SPARQL-style graph queries |
+| **nusy-codegraph** | Code-as-graph with tree-sitter parsing |
+| [nusy-kanban](https://github.com/hankh95/nusy-kanban) | Arrow-native kanban + HDD research |
+
+---
+
+## Limitations
+
+- **Python support is partial** — only functions and classes are extracted. Type hints,
+  decorators, and complex control flow are not yet parsed.
+- **Only Rust and Python** — no TypeScript, Go, or other languages.
+- **Not standalone** — requires `nusy-arrow-core`, `nusy-arrow-git`, `nusy-graph-query`,
+  and `noesis-ship` as path dependencies. A fully FOSS version would need to publish
+  those crates separately or reimplement against public crate equivalents.
+- **No incremental parsing** — re-ingestion is a full re-parse. Large codebases pay
+  the full tree-sitter cost on every update.
+
+---
 
 ## License
 
