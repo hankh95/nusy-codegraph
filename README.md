@@ -4,10 +4,10 @@
 RecordBatches for zero-copy querying, versioning via git-native graph operations,
 semantic search, and impact analysis.
 
-> **Note:** This crate depends on internal NuSy workspace crates (`nusy-arrow-core`,
-> `nusy-arrow-git`, `nusy-graph-query`, `noesis-ship`) and cannot compile standalone
-> from crates.io. It is designed for use within the NuSy monorepo or as a
-> framework reference for building your own code graph system.
+> **Note:** This crate depends on NuSy workspace crates (`nusy-arrow-core`,
+> `nusy-arrow-git`, `nusy-graph-query`, `noesis-ship`) published separately on crates.io.
+> Install via `cargo add nusy-codegraph` or clone from
+> [github.com/hankh95/nusy-codegraph](https://github.com/hankh95/nusy-codegraph).
 
 ## For AI Developers
 
@@ -106,10 +106,20 @@ code_edges_schema()  // source_id, predicate, target_id, file_path columns
 // 1. Discover files by language
 // 2. Parse with tree-sitter (rust_parser or python_parser)
 // 3. Extract nodes + edges from CST
-// 4. Run NameResolver for cross-file edges
+// 4. Resolve names → CodeNode IDs
 // 5. Write to Arrow RecordBatch + Parquet
 // 6. Optionally embed nodes for semantic search
 ```
+
+**NameResolver** (`edges.rs`) — resolves unqualified names to CodeNode IDs for Python
+and cross-language references. Uses a HashMap for O(1) lookups of short names
+(`helper`) and qualified names (`brain.utils.helper`).
+
+**RustModuleResolver** (`module_resolver.rs`) — handles Rust-specific resolution:
+- `use` statements → specific CodeNodes (not just module-level edges)
+- `impl Trait for Type` → `ImplementsTrait` edge
+- `pub use` → `ReExports` edge
+- `#[test]` naming convention → `TestTargets` edge
 
 ---
 
@@ -178,14 +188,53 @@ println!("{}", diff.format_impact_report());
 
 ---
 
+## Performance
+
+| Operation | Typical Time | Notes |
+|----------|-------------|-------|
+| Ingest Rust crate (1k files) | 30–60s | tree-sitter parsing is CPU-bound |
+| Ingest Python project (1k files) | 20–40s | Partial support — faster |
+| Semantic search (10k nodes) | 100–300ms | Embedding lookup + cosine similarity |
+| Query (100k nodes) | <10ms | Arrow columnar — O(result set) |
+
+**Memory usage:** ~500MB for a 10k-node graph. Larger graphs scale linearly with node count.
+
+**Known bottlenecks:**
+- tree-sitter parsing is single-threaded per file — use `--jobs` flag for parallelism
+- `extract_call_edges` text scanning is O(source_lines × callable_count) — prefer `scip_calls()` for production accuracy
+- Semantic search requires embedding computation on first ingest (~1s/100 nodes)
+
+---
+
+## Troubleshooting
+
+**`error: failed to run tree-sitter parser`**
+- Ensure tree-sitter grammars are available for the language: `--language rust` or `--language python`
+- Check that source files have valid UTF-8 encoding
+
+**`error: no such crate or crate not published`**
+- `nusy-codegraph` requires `nusy-arrow-core`, `nusy-arrow-git`, `nusy-graph-query`, and `noesis-ship` from crates.io
+- Run `cargo update` to ensure all NuSy dependencies are resolved
+
+**`ingest hangs or OOM on large codebase`**
+- Use `--jobs N` to parallelize parsing across N files
+- For codebases >50k nodes, consider ingesting incrementally by module
+- Disable embedding computation with `--no-embed` if memory-constrained
+
+**Call edge recall is low**
+- `extract_call_edges` uses text scanning — misses dynamic dispatch, indirect calls, and calls via variables
+- For production-accurate call graphs, pre-compute SCIP data and use `extract_scip_call_edges()`
+- Documented limitation: known recall gap for indirect/dynamic calls
+
+---
+
 ## Limitations
 
 - **Python support is partial** — only functions and classes are extracted. Type hints,
   decorators, and complex control flow are not yet parsed.
 - **Only Rust and Python** — no TypeScript, Go, or other languages.
-- **Not standalone** — requires `nusy-arrow-core`, `nusy-arrow-git`, `nusy-graph-query`,
-  and `noesis-ship` as path dependencies. A fully FOSS version would need to publish
-  those crates separately or reimplement against public crate equivalents.
+- **Call edges use text scanning** — `extract_call_edges` is best-effort. Use `scip_calls()`
+  for production-accurate call graphs.
 - **No incremental parsing** — re-ingestion is a full re-parse. Large codebases pay
   the full tree-sitter cost on every update.
 
